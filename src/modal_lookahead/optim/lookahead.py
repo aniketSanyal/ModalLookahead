@@ -1,63 +1,116 @@
-import numpy as np, math
-from ..controllers.spectral_power import dominant_sigma_from_grads, dominant_mode_from_hvp
+# src/modal_lookahead/optim/lookahead.py
+"""
+Lookahead wrapper with optional *Modal* adaptation.
 
-class FixedLookahead:
-    def __init__(self, k=5, alpha=0.5):
-        self.k=int(k); self.alpha=float(alpha)
-    def run(self, problem, T, x0, y0):
-        x=x0.copy(); y=y0.copy(); xa=x.copy(); ya=y.copy(); dists=[]; t=0
-        for _ in range(T):
-            x,y=problem.step_gda(x,y); t+=1
-            if t==self.k:
-                x=(1.0-self.alpha)*xa + self.alpha*x
-                y=(1.0-self.alpha)*ya + self.alpha*y
-                xa=x.copy(); ya=y.copy(); t=0
-            dists.append(float(np.linalg.norm(np.concatenate([x,y]))))
-        return dists
+Modes:
+- fixed:     keep (k, alpha) constant.
+- modal_grid: at each macro step, estimate (R, theta) and pick (k, alpha)
+              via full grid search to minimize the modal contraction.
 
-class ModalLookahead:
+This module is framework-agnostic for (k, alpha) selection. Your inner
+optimizer and model updates can be PyTorch/JAX/etc; pass a spectral
+estimator callable that returns (R, theta).
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Callable, Dict, Tuple, Optional
+from .typing import ArrayLike  # if you have a typing helper; else remove
+from ..controllers.selectors import (
+    GridConfig, choose_modal_params_full_grid, ModalChoice
+)
+
+@dataclass
+class LookaheadConfig:
+    k: int = 5
+    alpha: float = 0.5
+    mode: str = "fixed"  # "fixed" or "modal_grid"
+    # grid config for the modal selector
+    grid: GridConfig = GridConfig()
+
+class Lookahead:
     """
-    Modal Lookahead using the k_phase / k_amp rule.
-    Backends:
-      - mode='grad_bilinear': uses grad_x, grad_y (first-order) to estimate sigma_max.
-      - mode='hvp': uses problem.hvp (second-order) to estimate dominant eigen of G.
-    In SC-SC isotropic (mu_x=mu_y=mu), per-mode eigen of G: z = (1 - gamma*mu) +/- i * (gamma*sigma).
+    Generic Lookahead wrapper for min-max / games.
+
+    You provide:
+      - inner_step(x, y): applies ONE base-optimizer step (e.g., simultaneous GDA) in-place or returns new states.
+      - spectral_estimator(**kwargs) -> (R, theta): dominant one-step mode near current iterate.
+      - estimator_kwargs_fn(): callable that returns kwargs for spectral_estimator at runtime.
     """
-    def __init__(self, mode='grad_bilinear', alpha=0.5):
-        assert mode in ('grad_bilinear','hvp')
-        self.mode = mode
-        self.alpha = float(alpha)
 
-    @staticmethod
-    def _k_phase_k_amp(alpha, R, theta):
-        if abs(R-1.0) < 1e-12:
-            k_amp = 1e9
-        else:
-            k_amp = math.log((1.0 - alpha)/alpha)/math.log(R)
-        k_circ = math.pi/max(theta,1e-12)
-        k_floor, k_ceil = int(math.floor(k_circ)), int(math.ceil(k_circ))
-        def rho(k):
-            s = R**k
-            return math.sqrt((1.0-alpha)**2 + 2.0*alpha*(1.0-alpha)*s*math.cos(k*theta) + (alpha**2)*(s**2))
-        k_best = max(1, min(k_floor, k_ceil, key=rho))
-        return k_best
+    def __init__(
+        self,
+        cfg: LookaheadConfig,
+        inner_step: Callable[..., Tuple],
+        spectral_estimator: Optional[Callable[..., Tuple[float, float]]] = None,
+        estimator_kwargs_fn: Optional[Callable[[], Dict]] = None,
+    ):
+        self.k = int(cfg.k)
+        self.alpha = float(cfg.alpha)
+        self.mode = cfg.mode
+        self.grid_cfg = cfg.grid
 
-    def run(self, problem, T, x0, y0):
-        if self.mode == 'grad_bilinear':
-            sigma = dominant_sigma_from_grads(problem.grad_x, problem.grad_y, problem.d, iters=120)
-            mu = getattr(problem, "mu_x", 0.0) * 0.5 + getattr(problem, "mu_y", 0.0) * 0.5
-            R = ((1.0 - problem.gamma*mu)**2 + (problem.gamma*sigma)**2)**0.5
-            theta = math.atan2(problem.gamma*sigma, max(1e-12, 1.0 - problem.gamma*mu))
-        else:
-            R, theta, _ = dominant_mode_from_hvp(problem)
-        k = self._k_phase_k_amp(self.alpha, R, theta)
+        self.inner_step = inner_step
+        self.spectral_estimator = spectral_estimator
+        self.estimator_kwargs_fn = estimator_kwargs_fn
 
-        x=x0.copy(); y=y0.copy(); xa=x.copy(); ya=y.copy(); dists=[]; t=0
-        for _ in range(T):
-            x,y=problem.step_gda(x,y); t+=1
-            if t==k:
-                x=(1.0-self.alpha)*xa + self.alpha*x
-                y=(1.0-self.alpha)*ya + self.alpha*y
-                xa=x.copy(); ya=y.copy(); t=0
-            dists.append(float(np.linalg.norm(np.concatenate([x,y]))))
-        return dists, {"k":k, "alpha":self.alpha, "R":R, "theta":theta}
+        # Lookahead anchor (reference copy)
+        self._anchor = None
+        self._step_in_cycle = 0  # counts inner steps since last averaging
+
+    # -- utility ---------------------------------------------------------
+
+    def _maybe_init_anchor(self, state):
+        if self._anchor is None:
+            self._anchor = self._clone_state(state)
+
+    def _clone_state(self, state):
+        # Assumes (x, y) tuple of arrays/tensors. Override if you have a model dict.
+        x, y = state
+        return (x.copy(), y.copy())
+
+    def _average(self, state):
+        # z <- (1-alpha) * anchor + alpha * state
+        ax, ay = self._anchor
+        x, y = state
+        x_new = (1.0 - self.alpha) * ax + self.alpha * x
+        y_new = (1.0 - self.alpha) * ay + self.alpha * y
+        return (x_new, y_new)
+
+    # -- main loop -------------------------------------------------------
+
+    def step(self, state):
+        """
+        Performs one inner step, and if k steps have elapsed,
+        performs the lookahead averaging and (optionally) adapts (k, alpha).
+        """
+        # 1) inner base optimizer step
+        new_state = self.inner_step(state)
+
+        # 2) bookkeeping
+        self._maybe_init_anchor(state if self._step_in_cycle == 0 else self._anchor)
+        self._step_in_cycle += 1
+
+        # 3) averaging + modal selection if cycle finished
+        if self._step_in_cycle >= self.k:
+            # average
+            new_state = self._average(new_state)
+
+            # prepare next cycle
+            self._anchor = self._clone_state(new_state)
+            self._step_in_cycle = 0
+
+            # optional: adapt (k, alpha)
+            if self.mode == "modal_grid":
+                assert self.spectral_estimator is not None and self.estimator_kwargs_fn is not None, \
+                    "Modal mode requires spectral_estimator and estimator_kwargs_fn."
+                choice: ModalChoice = choose_modal_params_full_grid(
+                    spectral_estimator=self.spectral_estimator,
+                    estimator_kwargs=self.estimator_kwargs_fn(),
+                    grid_cfg=self.grid_cfg,
+                )
+                if choice.k is not None and choice.alpha is not None:
+                    self.k = int(max(1, choice.k))
+                    self.alpha = float(min(1.0, max(1e-12, choice.alpha)))
+
+        return new_state
