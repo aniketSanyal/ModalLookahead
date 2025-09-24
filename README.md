@@ -1,6 +1,5 @@
 # Modal Lookahead (Paper Code)
 
-This repository provides a clean, extensible implementation of Modal Lookahead for min–max games, targeted for top-tier AI/ML conference reproducibility.
 
 ## Features
 - Problems: bilinear and strongly-convex–strongly-concave (SC-SC) quadratics.
