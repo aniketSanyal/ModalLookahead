@@ -211,7 +211,7 @@ class AdaptiveModalLookahead:
 class FixedLookahead:
     """Baseline lookahead with constant (k, alpha)."""
 
-    def __init__(self, k: int = 5, alpha: float = 0.5):
+    def __init__(self, k: int = 50, alpha: float = 0.5):
         self.k = int(k)
         self.alpha = float(alpha)
         self._anchor = None
