@@ -2,8 +2,8 @@
 import argparse
 import numpy as np
 
-from modal_lookahead.problems.bilinear import BilinearGame
-from modal_lookahead.optim.lookahead import (
+from src.modal_lookahead.problems.bilinear import BilinearGame
+from src.modal_lookahead.optim.lookahead import (
     AdaptiveModalLookahead, AdaptiveLAConfig, WeightedModalConfig,
     FixedLookahead, choose_modal_params_weighted,
 )
