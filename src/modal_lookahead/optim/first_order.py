@@ -112,3 +112,18 @@ class OGDA:
         y_next = y + 2.0 * self.gamma * gy - self.gamma * self._gy_prev
         self._gx_prev, self._gy_prev = gx, gy
         return x_next, y_next
+
+
+@dataclass
+class GD:
+    """
+    Gradient descent with constant step γ.
+    """
+  
+    gamma: float
+
+    def step(self, problem, x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        gx, gy = _gx(problem, x, y), _gy(problem, x, y)
+        x_next = x - self.gamma * gx
+        y_next = y + self.gamma * gy
+        return x_next, y_next

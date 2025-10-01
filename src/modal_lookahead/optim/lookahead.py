@@ -44,9 +44,84 @@ class ModalChoice:
     alpha: float
 
 
+# def choose_modal_params_weighted(eigs: np.ndarray, cfg: WeightedModalConfig) -> ModalChoice:
+#     """
+#     Choose (k, alpha) using k_amp / k_phase + stability-bounded alpha grid search.
+
+#     Parameters
+#     ----------
+#     eigs : array-like of complex
+#         Eigenvalues of the current Jacobian J.
+#     cfg  : WeightedModalConfig
+#     """
+#     eigs = np.asarray(eigs)
+#     if eigs.size == 0:
+#         return ModalChoice(k=cfg.kmin, alpha=0.5)
+
+#     # One-step multipliers of the base update (I - gamma J)
+#     T = 1.0 - cfg.gamma * eigs
+
+#     # --- Reference snapshot to identify a "divergent" proxy ---
+#     k0, a0 = 5, 0.5
+#     vals = (1 - a0) + a0 * (T ** k0)
+#     z_div = T[int(np.argmax(np.abs(vals)))]     # worst under snapshot
+#     z_dom = T[int(np.argmax(np.abs(T)))]        # largest |T|
+
+#     # --- Weighted hybrid mode (magnitude weights) ---
+#     denom = (np.abs(z_dom) + np.abs(z_div))
+#     z_mix = 0.0 if denom == 0 else (np.abs(z_dom) * z_div + np.abs(z_div) * z_dom) / denom
+#     R = float(np.abs(z_mix))
+#     theta = float(np.angle(z_mix))
+
+#     # --- k from amplitude & phase matching ---
+#     if R == 1.0:
+#         k_amp = cfg.kmin
+#     else:
+#         try:
+#             k_amp = int(np.round(np.log((1 - a0) / a0) / np.log(R)))
+#         except Exception:
+#             k_amp = cfg.kmin
+
+#     k_phase = cfg.kmin if theta == 0.0 else int(np.round(np.pi / abs(theta)))
+
+#     k = int(np.clip(int(np.round((k_amp + k_phase) / 2)), cfg.kmin, cfg.kmax))
+
+#     # --- Global stability cap for alpha over all modes ---
+#     alpha_max_all = np.inf
+#     for z in np.atleast_1d(T):
+#         w = z ** k
+#         denom = abs(1 - w) ** 2
+#         if denom > 1e-12 and (1 - np.real(w)) > 0:
+#             alpha_max = 2 * (1 - np.real(w)) / denom
+#             alpha_max_all = min(alpha_max_all, alpha_max)
+#     if not np.isfinite(alpha_max_all):
+#         alpha_max_all = 1.0
+
+#     # --- Grid search alpha on (0, alpha_max_all] to minimize modal contraction ---
+#     alpha_grid = (
+#         np.linspace(0.05, 1.0, 50)
+#         if cfg.alpha_grid is None
+#         else np.asarray(list(cfg.alpha_grid), dtype=float)
+#     )
+
+#     best_alpha, best_rho = None, np.inf
+#     for alpha in alpha_grid:
+#         if alpha <= 0 or alpha > alpha_max_all:
+#             continue
+#         rho = abs((1 - alpha) + alpha * (z_mix ** k))
+#         if rho < best_rho:
+#             best_rho, best_alpha = rho, float(alpha)
+
+#     if best_alpha is None:
+#         best_alpha = float(min(0.5, alpha_max_all))
+
+#     return ModalChoice(k=int(k), alpha=float(best_alpha))
+
 def choose_modal_params_weighted(eigs: np.ndarray, cfg: WeightedModalConfig) -> ModalChoice:
     """
-    Choose (k, alpha) using k_amp / k_phase + stability-bounded alpha grid search.
+    Choose (k, alpha) by always selecting the mode with the largest modulus of
+    T_i = 1 - gamma * lambda_i, then using amplitude/phase matching for k and a
+    global-stability-bounded grid search for alpha.
 
     Parameters
     ----------
@@ -54,39 +129,35 @@ def choose_modal_params_weighted(eigs: np.ndarray, cfg: WeightedModalConfig) -> 
         Eigenvalues of the current Jacobian J.
     cfg  : WeightedModalConfig
     """
-    eigs = np.asarray(eigs)
+    eigs = np.asarray(eigs, dtype=complex)
     if eigs.size == 0:
         return ModalChoice(k=cfg.kmin, alpha=0.5)
 
     # One-step multipliers of the base update (I - gamma J)
     T = 1.0 - cfg.gamma * eigs
 
-    # --- Reference snapshot to identify a "divergent" proxy ---
-    k0, a0 = 5, 0.5
-    vals = (1 - a0) + a0 * (T ** k0)
-    z_div = T[int(np.argmax(np.abs(vals)))]     # worst under snapshot
-    z_dom = T[int(np.argmax(np.abs(T)))]        # largest |T|
+    # --- Select the single mode with largest modulus ---
+    idx = int(np.argmax(np.abs(T)))
+    z_sel = T[idx]
 
-    # --- Weighted hybrid mode (magnitude weights) ---
-    denom = (np.abs(z_dom) + np.abs(z_div))
-    z_mix = 0.0 if denom == 0 else (np.abs(z_dom) * z_div + np.abs(z_div) * z_dom) / denom
-    R = float(np.abs(z_mix))
-    theta = float(np.angle(z_mix))
+    # --- k from amplitude & phase matching on the selected mode ---
+    k0, a0 = 5, 0.5  # only used to define the amplitude target
+    R = float(np.abs(z_sel))
+    theta = float(np.angle(z_sel))
 
-    # --- k from amplitude & phase matching ---
     if R == 1.0:
         k_amp = cfg.kmin
     else:
         try:
+            # Solve for k so that |(1-a0) + a0 * R^k| is balanced around the snapshot target
             k_amp = int(np.round(np.log((1 - a0) / a0) / np.log(R)))
         except Exception:
             k_amp = cfg.kmin
 
     k_phase = cfg.kmin if theta == 0.0 else int(np.round(np.pi / abs(theta)))
-
     k = int(np.clip(int(np.round((k_amp + k_phase) / 2)), cfg.kmin, cfg.kmax))
 
-    # --- Global stability cap for alpha over all modes ---
+    # --- Global stability cap for alpha across ALL modes ---
     alpha_max_all = np.inf
     for z in np.atleast_1d(T):
         w = z ** k
@@ -97,7 +168,7 @@ def choose_modal_params_weighted(eigs: np.ndarray, cfg: WeightedModalConfig) -> 
     if not np.isfinite(alpha_max_all):
         alpha_max_all = 1.0
 
-    # --- Grid search alpha on (0, alpha_max_all] to minimize modal contraction ---
+    # --- Grid search alpha on (0, alpha_max_all] to minimize contraction of the selected mode ---
     alpha_grid = (
         np.linspace(0.05, 1.0, 50)
         if cfg.alpha_grid is None
@@ -105,10 +176,11 @@ def choose_modal_params_weighted(eigs: np.ndarray, cfg: WeightedModalConfig) -> 
     )
 
     best_alpha, best_rho = None, np.inf
+    z_pow = z_sel ** k
     for alpha in alpha_grid:
         if alpha <= 0 or alpha > alpha_max_all:
             continue
-        rho = abs((1 - alpha) + alpha * (z_mix ** k))
+        rho = abs((1 - alpha) + alpha * z_pow)
         if rho < best_rho:
             best_rho, best_alpha = rho, float(alpha)
 
@@ -116,8 +188,6 @@ def choose_modal_params_weighted(eigs: np.ndarray, cfg: WeightedModalConfig) -> 
         best_alpha = float(min(0.5, alpha_max_all))
 
     return ModalChoice(k=int(k), alpha=float(best_alpha))
-
-
 # --------------------------- Lookahead wrappers --------------------------------
 class AdaptiveModalLookahead:
     """

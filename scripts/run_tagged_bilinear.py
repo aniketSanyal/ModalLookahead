@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 import argparse
 import numpy as np
-
+import sys
+import torch
+import copy
+  
+# adding src to the system path
+sys.path.insert(0, '/Users/baraah/Downloads/ModalLookahead/src/')
+  
 from modal_lookahead.problems.bilinear import BilinearGame
 from modal_lookahead.optim.lookahead import (
     AdaptiveModalLookahead, AdaptiveLAConfig, WeightedModalConfig,
     FixedLookahead, choose_modal_params_weighted,
 )
-from modal_lookahead.optim.first_order import Extragradient, OGDA
+from modal_lookahead.optim.first_order import Extragradient, OGDA, GD
 from modal_lookahead.plotting.plots import plot_distance_curves
 
 
@@ -37,6 +43,8 @@ def main():
     ap.add_argument("--no_ogda", action="store_true")
     ap.add_argument("--no_modal", action="store_true")
     ap.add_argument("--no_fixed", action="store_true")
+    ap.add_argument("--no_sgd", action="store_true")
+    ap.add_argument("--no_adam", action="store_true")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -48,7 +56,7 @@ def main():
 
     methods = {}
     if not args.no_fixed:
-        methods["Fixed LA (k=5, α=0.5)"] = {
+        methods[f"Fixed LA (k={args.fixed_k}, α={args.fixed_alpha})"] = {
             "obj": FixedLookahead(k=args.fixed_k, alpha=args.fixed_alpha),
             "state": (x0.copy(), y0.copy()),
             "traj": [],
@@ -77,13 +85,33 @@ def main():
             "traj": [],
         }
 
+    if not args.no_sgd:
+        methods["GD"] = {
+            "obj": GD(gamma=args.gamma),
+            "state": (x0.copy(), y0.copy()),
+            "traj": [],
+        }
+
+    if not args.no_adam:
+        a = torch.tensor(x0, dtype=torch.float32, requires_grad=True)
+        b = torch.tensor(y0, dtype=torch.float32, requires_grad=True) 
+        opt_x = torch.optim.Adam([a], lr=args.gamma)                    # minimize
+        opt_y = torch.optim.Adam([b], lr=args.gamma)     # ascent
+        methods["Adam"] = {
+            "opt_x": opt_x,
+            "opt_y": opt_y,
+            "state": (a,b),
+            "traj": [],
+        }
+
     def gda_step(x, y):
         return prob.step_gda(x, y)
 
     total_steps = int(args.T)
+    tensor_A = torch.as_tensor(prob.A, dtype=torch.float32)
     for it in range(total_steps):
         if not args.no_fixed:
-            m = methods["Fixed LA (k=5, α=0.5)"]
+            m = methods[f"Fixed LA (k={args.fixed_k}, α={args.fixed_alpha})" ]
             fl, (x, y) = m["obj"], m["state"]
             if getattr(fl, "_anchor", None) is None:
                 fl._anchor, fl._step_in_cycle = fl._clone_state((x, y)), 0
@@ -127,6 +155,30 @@ def main():
             og, (x, y) = m["obj"], m["state"]
             x, y = og.step(prob, x, y)
             m["traj"].append(prob.distance(x, y))
+            m["state"] = (x, y)
+
+        if not args.no_sgd:
+            m = methods["GD"]
+            sgd, (x, y) = m["obj"], m["state"]
+            x, y = sgd.step(prob, x, y)
+            m["traj"].append(prob.distance(x, y))
+            m["state"] = (x, y)
+
+        if not args.no_adam:
+            m = methods["Adam"]
+            (x, y) = m["state"]
+            opt_x, opt_y = m["opt_x"], m["opt_y"]
+            opt_x.zero_grad()
+            opt_y.zero_grad()
+            val = x @ tensor_A @ y               # f(x, y)
+            gx, gy = torch.autograd.grad(val, (x, y))
+            x.grad = gx
+            y.grad = -gy                    # computes grads for both x and y
+            opt_x.step()                  # x ← x - Adam(∇x f)
+            opt_y.step()                  # y ← y + Adam(∇y f)  (because maximize=True)
+            with torch.no_grad():
+                m["traj"].append(prob.distance(x.detach().cpu().numpy(),
+                                   y.detach().cpu().numpy()))
             m["state"] = (x, y)
 
     curves = [(name, m["traj"]) for name, m in methods.items()]
