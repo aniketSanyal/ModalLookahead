@@ -1,231 +1,205 @@
-"""
-Adaptive (dynamic) Modal Lookahead + Fixed Lookahead baseline.
-
-- AdaptiveModalLookahead:
-  Updates (k, alpha) at the *end of every lookahead cycle* using your
-  weighted-mode selection:
-    1) T_i = 1 - gamma * lambda_i  (lambda_i are eigenvalues of J)
-    2) choose z_div (worst under snapshot k0=5, a0=0.5) and z_dom (largest |T|)
-    3) weighted hybrid z_mix
-    4) k_amp from amplitude match, k_phase from phase match -> k
-    5) global stability cap for alpha then grid search to minimize |(1-a)+a z_mix^k|
-
-- FixedLookahead:
-  Simple baseline with constant k and alpha.
-"""
+# lookahead.py — Modal Lookahead with k from (k_phase, k_amp) alignment, α by grid search.
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional, Tuple
 import numpy as np
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 
 # ----------------------------- Configs ----------------------------------------
 @dataclass
-class WeightedModalConfig:
-    gamma: float = 0.1
-    kmin: int = 5
-    kmax: int = 2000
-    alpha_grid: Optional[Iterable[float]] = None  # if None -> linspace(0.05,1.0,50)
+class ModalConfig:
+    gamma: float = 0.1                  # inner stepsize used to form T = I - γJ
+    kmin: int = 2                       # k >= 2 (k=1 makes lookahead trivial)
+    kmax: int = 512                     # hard cap on k
+    alpha_grid: Optional[Iterable[float]] = None  # if None -> np.linspace(0.02, 0.98, 97)
 
 
 @dataclass
 class AdaptiveLAConfig:
-    # Used for the very first cycle only (before the first spectral selection).
+    # used only for the very first cycle (before the first spectral selection)
     init_k: int = 5
     init_alpha: float = 0.5
-    weighted: WeightedModalConfig = field(default_factory=WeightedModalConfig)
+    modal: ModalConfig = field(default_factory=ModalConfig)
 
 
-# ------------------------ Weighted-mode selection -----------------------------
+# ------------------------ helpers (theory-backed) ------------------------------
+def _alpha_cap_for_modes(T: np.ndarray, k: int) -> float:
+    """
+    Global Schur-stability cap on α for the Lookahead map:
+        α_max_all(k) = min_i  2(1 - Re(T_i^k)) / |1 - T_i^k|^2 ,  restricted to positive numerators
+    (Appendix E.2, Eq. (37)).  If no positive bound exists, fall back to α_max = 1.0.
+    """
+    amax = np.inf
+    for z in np.atleast_1d(T):
+        w = z ** k
+        denom = abs(1.0 - w) ** 2
+        num = 1.0 - np.real(w)
+        if denom > 1e-16 and num > 0:
+            amax = min(amax, 2.0 * num / denom)
+    if not np.isfinite(amax):
+        amax = 1.0
+    return float(max(1e-12, min(1.0, amax)))
+
+
+def _k_candidates_for_alpha(T: np.ndarray, alpha: float, kmin: int, kmax: int) -> np.ndarray:
+    """
+    For a given α, build the union of k-candidates implied by per-mode alignment:
+        T_i = R_i e^{-iθ_i},  targets:  phase ϕ = π (mod 2π), amplitude s* = (1-α)/α
+        k_phase_i(m) = π(2m+1)/θ_i,   k_amp_i = ln((1-α)/α) / ln R_i
+        choose m_i* ≈ argmin_m |k_phase_i(m) - k_amp_i|
+        k_i° = k_phase_i(m_i*),  integer candidates {⌊k_i°⌋, ⌈k_i°⌉}
+    (Appendix E.3.) We aggregate candidates across modes, clip to [kmin,kmax].
+    """
+    # numerical guards
+    eps_th = 1e-12
+    eps_ln = 1e-12
+
+    Ks = set()
+    for z in np.atleast_1d(T):
+        R = float(abs(z))
+        theta = float(np.angle(z))
+
+        # amplitude target
+        if abs(np.log(max(R, eps_ln))) < 1e-14:  # ln R ≈ 0 → ignore amplitude match
+            k_amp = None
+        else:
+            k_amp = np.log((1.0 - alpha) / alpha) / np.log(max(R, eps_ln))
+
+        # phase targets
+        if abs(theta) < eps_th:  # no rotation: rely on amplitude only if available
+            if k_amp is not None and np.isfinite(k_amp):
+                k0 = float(k_amp)
+                for ki in (np.floor(k0), np.ceil(k0)):
+                    if np.isfinite(ki):
+                        Ks.add(int(np.clip(int(ki), kmin, kmax)))
+            continue
+
+        # pick m* nearest to k_amp; if k_amp missing, use m* from phase-only (k_amp=0 heuristic)
+        if (k_amp is None) or (not np.isfinite(k_amp)):
+            k_amp = 0.0
+        m_star = round((theta * k_amp / np.pi - 1.0) / 2.0)
+        m_star = max(0, int(m_star))
+
+        k_phase = np.pi * (2 * m_star + 1) / theta
+        k0 = abs(k_phase)  # sign flip corresponds to adding 2m cycles
+        for ki in (np.floor(k0), np.ceil(k0)):
+            if np.isfinite(ki):
+                Ks.add(int(np.clip(int(ki), kmin, kmax)))
+
+        # also add the amplitude-only candidate when meaningful
+        if np.isfinite(k_amp):
+            for ki in (np.floor(k_amp), np.ceil(k_amp)):
+                if np.isfinite(ki):
+                    Ks.add(int(np.clip(int(ki), kmin, kmax)))
+
+    if not Ks:
+        Ks = {kmin}
+    return np.array(sorted(Ks), dtype=int)
+
+
+# ---------------------- main selector: k by alignment, α by grid ----------------
 @dataclass
 class ModalChoice:
     k: int
     alpha: float
+    rho: float  # achieved worst-mode spectral radius
 
 
-# def choose_modal_params_weighted(eigs: np.ndarray, cfg: WeightedModalConfig) -> ModalChoice:
-#     """
-#     Choose (k, alpha) using k_amp / k_phase + stability-bounded alpha grid search.
-
-#     Parameters
-#     ----------
-#     eigs : array-like of complex
-#         Eigenvalues of the current Jacobian J.
-#     cfg  : WeightedModalConfig
-#     """
-#     eigs = np.asarray(eigs)
-#     if eigs.size == 0:
-#         return ModalChoice(k=cfg.kmin, alpha=0.5)
-
-#     # One-step multipliers of the base update (I - gamma J)
-#     T = 1.0 - cfg.gamma * eigs
-
-#     # --- Reference snapshot to identify a "divergent" proxy ---
-#     k0, a0 = 5, 0.5
-#     vals = (1 - a0) + a0 * (T ** k0)
-#     z_div = T[int(np.argmax(np.abs(vals)))]     # worst under snapshot
-#     z_dom = T[int(np.argmax(np.abs(T)))]        # largest |T|
-
-#     # --- Weighted hybrid mode (magnitude weights) ---
-#     denom = (np.abs(z_dom) + np.abs(z_div))
-#     z_mix = 0.0 if denom == 0 else (np.abs(z_dom) * z_div + np.abs(z_div) * z_dom) / denom
-#     R = float(np.abs(z_mix))
-#     theta = float(np.angle(z_mix))
-
-#     # --- k from amplitude & phase matching ---
-#     if R == 1.0:
-#         k_amp = cfg.kmin
-#     else:
-#         try:
-#             k_amp = int(np.round(np.log((1 - a0) / a0) / np.log(R)))
-#         except Exception:
-#             k_amp = cfg.kmin
-
-#     k_phase = cfg.kmin if theta == 0.0 else int(np.round(np.pi / abs(theta)))
-
-#     k = int(np.clip(int(np.round((k_amp + k_phase) / 2)), cfg.kmin, cfg.kmax))
-
-#     # --- Global stability cap for alpha over all modes ---
-#     alpha_max_all = np.inf
-#     for z in np.atleast_1d(T):
-#         w = z ** k
-#         denom = abs(1 - w) ** 2
-#         if denom > 1e-12 and (1 - np.real(w)) > 0:
-#             alpha_max = 2 * (1 - np.real(w)) / denom
-#             alpha_max_all = min(alpha_max_all, alpha_max)
-#     if not np.isfinite(alpha_max_all):
-#         alpha_max_all = 1.0
-
-#     # --- Grid search alpha on (0, alpha_max_all] to minimize modal contraction ---
-#     alpha_grid = (
-#         np.linspace(0.05, 1.0, 50)
-#         if cfg.alpha_grid is None
-#         else np.asarray(list(cfg.alpha_grid), dtype=float)
-#     )
-
-#     best_alpha, best_rho = None, np.inf
-#     for alpha in alpha_grid:
-#         if alpha <= 0 or alpha > alpha_max_all:
-#             continue
-#         rho = abs((1 - alpha) + alpha * (z_mix ** k))
-#         if rho < best_rho:
-#             best_rho, best_alpha = rho, float(alpha)
-
-#     if best_alpha is None:
-#         best_alpha = float(min(0.5, alpha_max_all))
-
-#     return ModalChoice(k=int(k), alpha=float(best_alpha))
-
-def choose_modal_params_weighted(eigs: np.ndarray, cfg: WeightedModalConfig) -> ModalChoice:
+def choose_modal_params_from_jacobian_eigs(
+    eigs: np.ndarray,
+    cfg: ModalConfig,
+) -> ModalChoice:
     """
-    Choose (k, alpha) by always selecting the mode with the largest modulus of
-    T_i = 1 - gamma * lambda_i, then using amplitude/phase matching for k and a
-    global-stability-bounded grid search for alpha.
-
-    Parameters
-    ----------
-    eigs : array-like of complex
-        Eigenvalues of the current Jacobian J.
-    cfg  : WeightedModalConfig
+    Choose (k, α) as follows:
+      1) Map Jacobian eigs λ_i to base multipliers T_i = 1 - γ λ_i.
+      2) For each α in a grid, build k-candidates from per-mode (k_phase, k_amp) alignment,
+         union them across modes, evaluate the worst-mode contraction
+             ρ_all(k, α) = max_i |(1-α) + α T_i^k|
+         only on those candidates (no k-grid sweep).
+      3) Enforce stability: α ≤ α_max_all(k) = min_i 2(1 - Re(T_i^k)) / |1 - T_i^k|^2.
+      4) Return the (k(α*), α*) minimizing ρ_all.
     """
     eigs = np.asarray(eigs, dtype=complex)
     if eigs.size == 0:
-        return ModalChoice(k=cfg.kmin, alpha=0.5)
+        return ModalChoice(k=max(2, cfg.kmin), alpha=0.5, rho=1.0)
 
-    # One-step multipliers of the base update (I - gamma J)
+    # base multipliers (one inner Euler step)
     T = 1.0 - cfg.gamma * eigs
 
-    # --- Select the single mode with largest modulus ---
-    idx = int(np.argmax(np.abs(T)))
-    z_sel = T[idx]
-
-    # --- k from amplitude & phase matching on the selected mode ---
-    k0, a0 = 5, 0.5  # only used to define the amplitude target
-    R = float(np.abs(z_sel))
-    theta = float(np.angle(z_sel))
-
-    if R == 1.0:
-        k_amp = cfg.kmin
-    else:
-        try:
-            # Solve for k so that |(1-a0) + a0 * R^k| is balanced around the snapshot target
-            k_amp = int(np.round(np.log((1 - a0) / a0) / np.log(R)))
-        except Exception:
-            k_amp = cfg.kmin
-
-    k_phase = cfg.kmin if theta == 0.0 else int(np.round(np.pi / abs(theta)))
-    k = int(np.clip(int(np.round((k_amp + k_phase) / 2)), cfg.kmin, cfg.kmax))
-
-    # --- Global stability cap for alpha across ALL modes ---
-    alpha_max_all = np.inf
-    for z in np.atleast_1d(T):
-        w = z ** k
-        denom = abs(1 - w) ** 2
-        if denom > 1e-12 and (1 - np.real(w)) > 0:
-            alpha_max = 2 * (1 - np.real(w)) / denom
-            alpha_max_all = min(alpha_max_all, alpha_max)
-    if not np.isfinite(alpha_max_all):
-        alpha_max_all = 1.0
-
-    # --- Grid search alpha on (0, alpha_max_all] to minimize contraction of the selected mode ---
+    # α grid
     alpha_grid = (
-        np.linspace(0.05, 1.0, 50)
+        np.linspace(0.02, 0.98, 97)
         if cfg.alpha_grid is None
         else np.asarray(list(cfg.alpha_grid), dtype=float)
     )
 
-    best_alpha, best_rho = None, np.inf
-    z_pow = z_sel ** k
+    best = ModalChoice(k=int(cfg.kmin), alpha=0.5, rho=np.inf)
+
     for alpha in alpha_grid:
-        if alpha <= 0 or alpha > alpha_max_all:
+        if not (0.0 < alpha < 1.0):
             continue
-        rho = abs((1 - alpha) + alpha * z_pow)
-        if rho < best_rho:
-            best_rho, best_alpha = rho, float(alpha)
 
-    if best_alpha is None:
-        best_alpha = float(min(0.5, alpha_max_all))
+        # k candidates induced by this α
+        Kc = _k_candidates_for_alpha(T, alpha, cfg.kmin, cfg.kmax)
+        if Kc.size == 0:
+            continue
 
-    return ModalChoice(k=int(k), alpha=float(best_alpha))
+        for k in Kc:
+            alpha_cap = _alpha_cap_for_modes(T, k)
+            if alpha > alpha_cap + 1e-15:
+                continue  # violates Schur stability; skip
+
+            rho = float(np.max(np.abs((1.0 - alpha) + alpha * (T ** k))))
+            if rho < best.rho:
+                best = ModalChoice(k=int(k), alpha=float(alpha), rho=rho)
+
+    if not np.isfinite(best.rho):
+        k_fb = int(cfg.kmin)
+        alpha_cap = _alpha_cap_for_modes(T, k_fb)
+        alpha_fb = min(0.5, alpha_cap)
+        rho_fb = float(np.max(np.abs((1.0 - alpha_fb) + alpha_fb * (T ** k_fb))))
+        best = ModalChoice(k=k_fb, alpha=alpha_fb, rho=rho_fb)
+
+    return best
+
+
 # --------------------------- Lookahead wrappers --------------------------------
 class AdaptiveModalLookahead:
     """
-    Lookahead wrapper that *adapts* (k, alpha) every cycle.
+    Lookahead wrapper that adapts (k, α) every cycle from *lookahead modes*,
+    using the alignment rule for k and a grid search only over α.
 
     Usage:
-        la = AdaptiveModalLookahead(AdaptiveLAConfig(weighted=WeightedModalConfig(gamma=0.1)))
+        la = AdaptiveModalLookahead(AdaptiveLAConfig(modal=ModalConfig(gamma=0.1)))
 
-        def inner_step(state):  # ONE base optimizer step (e.g., GDA)
+        def inner_step(state):   # EXACTLY ONE base step, e.g., GDA
             x, y = state
-            return problem.step_gda(x, y)
+            return base_step(x, y)
 
-        def spectral_eigs_fn():  # return eigenvalues of current J (or proxy)
-            J = ...
-            return np.linalg.eigvals(J)
+        def jacobian_eigs_fn():  # current eigs of J (or a proxy)
+            return eigs
 
         state = (x0, y0)
         for t in range(T):
-            state = la.step_cycle(state, inner_step, spectral_eigs_fn)
+            state = la.step_cycle(state, inner_step, jacobian_eigs_fn)
             # la.k and la.alpha are updated for the NEXT cycle
-
-    Notes:
-      * `state` is assumed to be a tuple (x, y) of arrays/tensors. Override
-        `_clone_state` if your state is a dict or framework object.
-      * Computing a full eigendecomposition every cycle can be expensive;
-        feel free to return a small proxy spectrum instead.
     """
 
     def __init__(self, cfg: AdaptiveLAConfig | None = None):
         if cfg is None:
             cfg = AdaptiveLAConfig()
         self.cfg = cfg
-
         self.k = int(cfg.init_k)
         self.alpha = float(cfg.init_alpha)
-
         self._anchor = None
-        self._step_in_cycle = 0
 
     # -- utilities --
     def _clone_state(self, state):
@@ -247,13 +221,14 @@ class AdaptiveModalLookahead:
         self,
         state,
         inner_step: Callable[[Tuple], Tuple],
-        spectral_eigs_fn: Callable[[], np.ndarray],
+        jacobian_eigs_fn: Callable[[], np.ndarray],
     ):
         """
-        Run ONE lookahead cycle:
-          1) k inner steps with base optimizer
-          2) average with current alpha
-          3) recompute (k, alpha) for the NEXT cycle via weighted-modal selector
+        One lookahead cycle:
+          (i) run k inner steps with the base optimizer
+          (ii) average with α against the saved anchor
+          (iii) refresh anchor and recompute (k, α) for the *next* cycle
+                using the modal (alignment+α-grid) selector
         """
         self._maybe_init_anchor(state)
 
@@ -267,19 +242,19 @@ class AdaptiveModalLookahead:
 
         # prepare next cycle
         self._anchor = self._clone_state(new_state)
-        self._step_in_cycle = 0
 
-        # dynamic (k, alpha) update for the NEXT cycle
-        eigs = spectral_eigs_fn()
-        choice = choose_modal_params_weighted(eigs, self.cfg.weighted)
-        self.k = int(np.clip(int(choice.k), self.cfg.weighted.kmin, self.cfg.weighted.kmax))
+        # update (k, α) from LOOKAHEAD modes computed using current J
+        eigs = jacobian_eigs_fn()
+        choice = choose_modal_params_from_jacobian_eigs(eigs, self.cfg.modal)
+        self.k = int(np.clip(choice.k, self.cfg.modal.kmin, self.cfg.modal.kmax))
         self.alpha = float(min(1.0, max(1e-12, float(choice.alpha))))
+        logger.info(f"Updated lookahead params: k={self.k}, alpha={self.alpha:.4f}, rho={choice.rho:.4f}")
 
         return new_state
 
 
 class FixedLookahead:
-    """Baseline lookahead with constant (k, alpha)."""
+    """Baseline lookahead with constant (k, α)."""
 
     def __init__(self, k: int = 50, alpha: float = 0.5):
         self.k = int(k)
@@ -308,3 +283,95 @@ class FixedLookahead:
         new_state = self._average(z)
         self._anchor = self._clone_state(new_state)
         return new_state
+
+
+# --------------------------- One-shot modal lookahead --------------------------
+@dataclass
+class UpdatedLAConfig:
+    """
+    Configuration for the one-shot modal lookahead that *freezes* (k, α)
+    after computing them once at the beginning of the first cycle.
+    """
+    modal: ModalConfig = field(default_factory=ModalConfig)
+    fallback_k: int = 5
+    fallback_alpha: float = 0.5
+
+
+class ModalUpdatedLookahead:
+    """
+    Like AdaptiveModalLookahead, but (k, α) are selected exactly ONCE
+    at the beginning of the FIRST cycle using the same selector (alignment + α-grid),
+    and then kept FIXED for all subsequent cycles.
+    """
+
+    def __init__(self, cfg: UpdatedLAConfig | None = None):
+        if cfg is None:
+            cfg = UpdatedLAConfig()
+        self.cfg = cfg
+        self.k = int(cfg.fallback_k)
+        self.alpha = float(cfg.fallback_alpha)
+        self._anchor = None
+        self._chosen_once = False  # toggled after first (k, α) selection
+
+    # -- utilities --
+    def _clone_state(self, state):
+        x, y = state
+        return (x.copy(), y.copy())
+
+    def _maybe_init_anchor(self, state):
+        if self._anchor is None:
+            self._anchor = self._clone_state(state)
+
+    def _average(self, state):
+        ax, ay = self._anchor
+        x, y = state
+        return ((1 - self.alpha) * ax + self.alpha * x,
+                (1 - self.alpha) * ay + self.alpha * y)
+
+    # -- main API --
+    def step_cycle(
+        self,
+        state,
+        inner_step: Callable[[Tuple], Tuple],
+        jacobian_eigs_fn: Callable[[], np.ndarray],
+    ):
+        """
+        One lookahead cycle with fixed (k, α) after the first selection.
+
+        At the BEGINNING of the FIRST cycle:
+          - compute eigs = jacobian_eigs_fn()
+          - choose (k, α) with choose_modal_params_from_jacobian_eigs
+          - freeze them for the remainder of the run
+
+        Then every cycle:
+          - run k inner steps
+          - average with α against the anchor
+          - refresh anchor
+        """
+        self._maybe_init_anchor(state)
+
+        # One-shot selection BEFORE running the very first k inner steps
+        if not self._chosen_once:
+            eigs = jacobian_eigs_fn()
+            choice = choose_modal_params_from_jacobian_eigs(eigs, self.cfg.modal)
+            self.k = int(np.clip(choice.k, self.cfg.modal.kmin, self.cfg.modal.kmax))
+            self.alpha = float(min(1.0, max(1e-12, float(choice.alpha))))
+            self._chosen_once = True
+            logger.info(f"[ModalUpdated] Chosen once: k={self.k}, alpha={self.alpha:.4f}, rho={choice.rho:.4f}")
+
+        # Run k inner steps
+        z = self._clone_state(state)
+        for _ in range(int(self.k)):
+            z = inner_step(z)
+
+        # Lookahead averaging
+        new_state = self._average(z)
+
+        # Refresh anchor (params remain fixed)
+        self._anchor = self._clone_state(new_state)
+
+        return new_state
+
+
+# Optional lowercase alias if someone prefers importing by this name
+modal_updated_lookahead = ModalUpdatedLookahead
