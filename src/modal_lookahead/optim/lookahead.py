@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional, Tuple
 import numpy as np
 import logging
+import copy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +30,12 @@ class AdaptiveLAConfig:
     init_alpha: float = 0.5
     modal: ModalConfig = field(default_factory=ModalConfig)
 
-
+def _alpha_grid_from_cfg(cfg: ModalConfig) -> np.ndarray:
+    return (
+        np.linspace(0.02, 0.98, 97)
+        if cfg.alpha_grid is None
+        else np.asarray(list(cfg.alpha_grid), dtype=float)
+    )
 # ------------------------ helpers (theory-backed) ------------------------------
 def _alpha_cap_for_modes(T: np.ndarray, k: int) -> float:
     """
@@ -113,9 +119,10 @@ class ModalChoice:
     rho: float  # achieved worst-mode spectral radius
 
 
-def choose_modal_params_from_jacobian_eigs(
+def choose_modal_params_from_jacobian_eigs_grid(
     eigs: np.ndarray,
     cfg: ModalConfig,
+    return_amax: bool = False,
 ) -> ModalChoice:
     """
     Choose (k, α) as follows:
@@ -168,9 +175,140 @@ def choose_modal_params_from_jacobian_eigs(
         rho_fb = float(np.max(np.abs((1.0 - alpha_fb) + alpha_fb * (T ** k_fb))))
         best = ModalChoice(k=k_fb, alpha=alpha_fb, rho=rho_fb)
 
+    if return_amax:
+        return best, alpha_cap
+
+    return best
+
+# =============================== METHOD 1: DOMINANT MODE ===============================
+def choose_modal_params_dominant_from_jacobian_eigs_dom(
+    eigs: np.ndarray,
+    cfg: ModalConfig,
+    *,
+    stability_all_modes: bool = True,
+    score_all_modes: bool = True,
+) -> ModalChoice:
+    """
+    Pick k-candidates using ONLY the mode with largest |T_i|.
+    By default, stability bound and scoring still use ALL modes (conservative).
+    Toggle `stability_all_modes=False` or `score_all_modes=False` to restrict to the dominant mode.
+    """
+    eigs = np.asarray(eigs, dtype=complex)
+    if eigs.size == 0:
+        return ModalChoice(k=max(2, cfg.kmin), alpha=0.5, rho=1.0)
+
+    # Base multipliers (one inner Euler step)
+    T_all = 1.0 - cfg.gamma * eigs
+
+    # Select dominant mode
+    i_dom = int(np.argmax(np.abs(T_all)))
+    T_dom = np.array([T_all[i_dom]], dtype=complex)
+
+    # What to use for stability & scoring?
+    T_stab = T_all if stability_all_modes else T_dom
+    T_score = T_all if score_all_modes else T_dom
+
+    alpha_grid = _alpha_grid_from_cfg(cfg)
+    best = ModalChoice(k=int(cfg.kmin), alpha=0.5, rho=np.inf)
+
+    for alpha in alpha_grid:
+        if not (0.0 < alpha < 1.0):
+            continue
+
+        # k candidates induced by the dominant mode only
+        Kc = _k_candidates_for_alpha(T_dom, alpha, cfg.kmin, cfg.kmax)
+        if Kc.size == 0:
+            continue
+
+        for k in Kc:
+            # Stability cap (default: across all modes)
+            alpha_cap = _alpha_cap_for_modes(T_stab, k)
+            if alpha > alpha_cap + 1e-15:
+                continue
+
+            # Worst-mode spectral radius (default: across all modes)
+            rho = float(np.max(np.abs((1.0 - alpha) + alpha * (T_score ** k))))
+            if rho < best.rho:
+                best = ModalChoice(k=int(k), alpha=float(alpha), rho=rho)
+
+    # Fallback if nothing feasible
+    if not np.isfinite(best.rho):
+        k_fb = int(cfg.kmin)
+        alpha_cap = _alpha_cap_for_modes(T_stab, k_fb)
+        alpha_fb = min(0.5, alpha_cap)
+        rho_fb = float(np.max(np.abs((1.0 - alpha_fb) + alpha_fb * (T_score ** k_fb))))
+        best = ModalChoice(k=k_fb, alpha=alpha_fb, rho=rho_fb)
+
     return best
 
 
+# ============================ METHOD 2: WEIGHTED-AVERAGE MODE ============================
+def choose_modal_params_weighted_from_jacobian_eigs_weighted(
+    eigs: np.ndarray,
+    cfg: ModalConfig,
+    *,
+    stability_all_modes: bool = True,
+    score_all_modes: bool = True,
+) -> ModalChoice:
+    """
+    Pick k-candidates using a single representative mode:
+        T_rep = (sum_i |T_i| T_i) / (sum_i |T_i|)
+    By default, stability bound and scoring still use ALL modes (conservative).
+    """
+    eigs = np.asarray(eigs, dtype=complex)
+    if eigs.size == 0:
+        return ModalChoice(k=max(2, cfg.kmin), alpha=0.5, rho=1.0)
+
+    # Base multipliers (one inner Euler step)
+    T_all = 1.0 - cfg.gamma * eigs
+    mags = np.abs(T_all)
+    wsum = float(np.sum(mags))
+
+    # Representative weighted-average mode (guard zero-weight edge case)
+    if wsum <= 1e-30:
+        # Degenerate: fall back to simple mean
+        T_rep_val = complex(np.mean(T_all))
+    else:
+        T_rep_val = complex(np.sum(mags * T_all) / wsum)
+
+    T_rep = np.array([T_rep_val], dtype=complex)
+
+    # What to use for stability & scoring?
+    T_stab = T_all if stability_all_modes else T_rep
+    T_score = T_all if score_all_modes else T_rep
+
+    alpha_grid = _alpha_grid_from_cfg(cfg)
+    best = ModalChoice(k=int(cfg.kmin), alpha=0.5, rho=np.inf)
+
+    for alpha in alpha_grid:
+        if not (0.0 < alpha < 1.0):
+            continue
+
+        # k candidates induced by the representative mode only
+        Kc = _k_candidates_for_alpha(T_rep, alpha, cfg.kmin, cfg.kmax)
+        if Kc.size == 0:
+            continue
+
+        for k in Kc:
+            # Stability cap (default: across all modes)
+            alpha_cap = _alpha_cap_for_modes(T_stab, k)
+            if alpha > alpha_cap + 1e-15:
+                continue
+
+            # Worst-mode spectral radius (default: across all modes)
+            rho = float(np.max(np.abs((1.0 - alpha) + alpha * (T_score ** k))))
+            if rho < best.rho:
+                best = ModalChoice(k=int(k), alpha=float(alpha), rho=rho)
+
+    # Fallback if nothing feasible
+    if not np.isfinite(best.rho):
+        k_fb = int(cfg.kmin)
+        alpha_cap = _alpha_cap_for_modes(T_stab, k_fb)
+        alpha_fb = min(0.5, alpha_cap)
+        rho_fb = float(np.max(np.abs((1.0 - alpha_fb) + alpha_fb * (T_score ** k_fb))))
+        best = ModalChoice(k=k_fb, alpha=alpha_fb, rho=rho_fb)
+
+    return best
 # --------------------------- Lookahead wrappers --------------------------------
 class AdaptiveModalLookahead:
     """
@@ -222,6 +360,7 @@ class AdaptiveModalLookahead:
         state,
         inner_step: Callable[[Tuple], Tuple],
         jacobian_eigs_fn: Callable[[], np.ndarray],
+        eig_type: str = "grid",
     ):
         """
         One lookahead cycle:
@@ -245,7 +384,12 @@ class AdaptiveModalLookahead:
 
         # update (k, α) from LOOKAHEAD modes computed using current J
         eigs = jacobian_eigs_fn()
-        choice = choose_modal_params_from_jacobian_eigs(eigs, self.cfg.modal)
+        if eig_type == "grid":
+            choice = choose_modal_params_from_jacobian_eigs_grid(eigs, self.cfg.modal) #change this w.r.t whjich eigs to use
+        elif eig_type == "dom":
+            choice = choose_modal_params_dominant_from_jacobian_eigs_dom(eigs, self.cfg.modal) #change this w.r.t whjich eigs to use
+        elif eig_type == "weighted":
+            choice = choose_modal_params_weighted_from_jacobian_eigs_weighted(eigs, self.cfg.modal) #change this w.r.t whjich eigs to use
         self.k = int(np.clip(choice.k, self.cfg.modal.kmin, self.cfg.modal.kmax))
         self.alpha = float(min(1.0, max(1e-12, float(choice.alpha))))
         logger.info(f"Updated lookahead params: k={self.k}, alpha={self.alpha:.4f}, rho={choice.rho:.4f}")
@@ -263,7 +407,7 @@ class FixedLookahead:
 
     def _clone_state(self, state):
         x, y = state
-        return (x.copy(), y.copy())
+        return (copy.copy(x), copy.copy(y))
 
     def _maybe_init_anchor(self, state):
         if self._anchor is None:
@@ -334,6 +478,7 @@ class ModalUpdatedLookahead:
         state,
         inner_step: Callable[[Tuple], Tuple],
         jacobian_eigs_fn: Callable[[], np.ndarray],
+        eig_type: str = "grid",
     ):
         """
         One lookahead cycle with fixed (k, α) after the first selection.
@@ -353,7 +498,12 @@ class ModalUpdatedLookahead:
         # One-shot selection BEFORE running the very first k inner steps
         if not self._chosen_once:
             eigs = jacobian_eigs_fn()
-            choice = choose_modal_params_from_jacobian_eigs(eigs, self.cfg.modal)
+            if eig_type == "grid":
+                choice = choose_modal_params_from_jacobian_eigs_grid(eigs, self.cfg.modal) #change this w.r.t whjich eigs to use
+            elif eig_type == "dom":
+                choice = choose_modal_params_dominant_from_jacobian_eigs_dom(eigs, self.cfg.modal) #change this w.r.t whjich eigs to use
+            elif eig_type == "weighted":
+                choice = choose_modal_params_weighted_from_jacobian_eigs_weighted(eigs, self.cfg.modal) #change this w.r.t whjich eigs to use
             self.k = int(np.clip(choice.k, self.cfg.modal.kmin, self.cfg.modal.kmax))
             self.alpha = float(min(1.0, max(1e-12, float(choice.alpha))))
             self._chosen_once = True
