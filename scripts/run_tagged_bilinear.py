@@ -7,7 +7,7 @@ import copy
 from time import time, process_time
   
 # adding src to the system path
-sys.path.insert(0, '/Users/baraah/Downloads/ModalLookahead/src/')
+sys.path.insert(0, '../ModalLookahead/src/')
   
 from modal_lookahead.problems.bilinear import BilinearGame
 from modal_lookahead.optim.lookahead import (
@@ -56,67 +56,10 @@ def main():
     prob = build_problem(args.d, args.beta, args.gamma, args.seed)
 
     # Initial state
-    x0 = rng.normal(size=(prob.d,)) * 5.0
-    y0 = rng.normal(size=(prob.d,)) * 5.0
+    x0 = rng.normal(size=(prob.d,)) * 1.0
+    y0 = rng.normal(size=(prob.d,)) * 1.0
 
     methods = {}
-    if not args.no_fixed:
-        methods[f"Fixed LA-GD (k={args.fixed_k}, α={args.fixed_alpha})"] = {
-            "obj": FixedLookahead(k=args.fixed_k, alpha=args.fixed_alpha),
-            "state": (x0.copy(), y0.copy()),
-            "traj": [],
-            "wc_times": [],
-        }
-    if not args.no_modal_weighted:
-        la = AdaptiveModalLookahead(
-            AdaptiveLAConfig(
-                init_k=args.fixed_k,
-                init_alpha=args.fixed_alpha,
-                # weighted=ModalConfig(
-                #     gamma=args.gamma, kmin=5, kmax=2000, alpha_grid=None
-                # ),
-            )
-        )
-        methods["Modal LA (dynamic) weighted"] = {"obj": la, "state": (x0.copy(), y0.copy()), "traj": [], "wc_times": []}
-
-    if not args.no_modal_dom:
-        la = AdaptiveModalLookahead(
-            AdaptiveLAConfig(
-                init_k=args.fixed_k,
-                init_alpha=args.fixed_alpha,
-                # dominant=ModalConfig(
-                #     gamma=args.gamma, kmin=5, kmax=2000, alpha_grid=None
-                # ),
-            )
-        )
-        methods["Modal LA (dynamic) dom"] = {"obj": la, "state": (x0.copy(), y0.copy()), "traj": [], "wc_times": []}
-
-    if not args.no_modal_grid:
-        la = AdaptiveModalLookahead(
-            AdaptiveLAConfig(
-                init_k=args.fixed_k,
-                init_alpha=args.fixed_alpha,
-                modal=ModalConfig(
-                    gamma=args.gamma, kmin=5, kmax=2000, alpha_grid=None
-                ),
-            )
-        )
-        methods["Modal LA (dynamic) grid"] = {"obj": la, "state": (x0.copy(), y0.copy()), "traj": [], "wc_times": []}
-
-    if not args.no_eg:
-        methods["Extragradient"] = {
-            "obj": Extragradient(gamma=args.gamma),
-            "state": (x0.copy(), y0.copy()),
-            "traj": [],
-            "wc_times": [],
-        }
-    if not args.no_ogda:
-        methods["OGDA"] = {
-            "obj": OGDA(gamma=args.gamma),
-            "state": (x0.copy(), y0.copy()),
-            "traj": [],
-            "wc_times": [],
-        }
 
     if not args.no_sgd:
         methods["GD"] = {
@@ -144,7 +87,7 @@ def main():
         b = torch.tensor(y0, dtype=torch.float32, requires_grad=True) 
         opt_x = torch.optim.Adam([a], lr=args.gamma)                    # minimize
         opt_y = torch.optim.Adam([b], lr=args.gamma, maximize=True)    # ascent
-        methods[f"Fixed LA-adam (k={args.fixed_k}, α={args.fixed_alpha})"] = {
+        methods[f"LA-adam (k={args.fixed_k}, α={args.fixed_alpha})"] = {
             "obj": FixedLookahead(k=args.fixed_k, alpha=args.fixed_alpha),
             "opt_x": opt_x,
             "opt_y": opt_y,
@@ -152,17 +95,108 @@ def main():
             "traj": [],
             "wc_times": [],
         }
+    
+    if not args.no_eg:
+        methods["EG"] = {
+            "obj": Extragradient(gamma=args.gamma),
+            "state": (x0.copy(), y0.copy()),
+            "traj": [],
+            "wc_times": [],
+        }
+    if not args.no_ogda:
+        methods["OGD"] = {
+            "obj": OGDA(gamma=args.gamma),
+            "state": (x0.copy(), y0.copy()),
+            "traj": [],
+            "wc_times": [],
+        }
+
+    if not args.no_fixed:
+        methods[f"LA (k={args.fixed_k}, α={args.fixed_alpha})"] = {
+            "obj": FixedLookahead(k=args.fixed_k, alpha=args.fixed_alpha),
+            "state": (x0.copy(), y0.copy()),
+            "traj": [],
+            "wc_times": [],
+        }
+
+    if not args.no_modal_weighted:
+        la = AdaptiveModalLookahead(
+            AdaptiveLAConfig(
+                init_k=args.fixed_k,
+                init_alpha=args.fixed_alpha,
+                # weighted=ModalConfig(
+                #     gamma=args.gamma, kmin=5, kmax=2000, alpha_grid=None
+                # ),
+            )
+        )
+        methods["MoLA weighted"] = {"obj": la, "state": (x0.copy(), y0.copy()), "traj": [], "wc_times": []}
+
+    if not args.no_modal_dom:
+        la = AdaptiveModalLookahead(
+            AdaptiveLAConfig(
+                init_k=args.fixed_k,
+                init_alpha=args.fixed_alpha,
+                # dominant=ModalConfig(
+                #     gamma=args.gamma, kmin=5, kmax=2000, alpha_grid=None
+                # ),
+            )
+        )
+        methods["MoLA"] = {"obj": la, "state": (x0.copy(), y0.copy()), "traj": [], "wc_times": []}
+
+    if not args.no_modal_grid:
+        la = AdaptiveModalLookahead(
+            AdaptiveLAConfig(
+                init_k=args.fixed_k,
+                init_alpha=args.fixed_alpha,
+                modal=ModalConfig(
+                    gamma=args.gamma, kmin=5, kmax=2000, alpha_grid=None
+                ),
+            )
+        )
+        methods["MoLA grid"] = {"obj": la, "state": (x0.copy(), y0.copy()), "traj": [], "wc_times": []}
+
 
     def gda_step(x, y):
         return prob.step_gda(x, y)
 
     total_steps = int(args.T)
     tensor_A = torch.as_tensor(prob.A, dtype=torch.float32)
+
+    if not args.no_eg:
+        eg_t1=process_time()
+        m = methods["EG"]
+        eg_t2=process_time()
+        m["wc_times"].append(eg_t1-eg_t2)
+        
+        eg, (x, y) = m["obj"], m["state"]
+        m["traj"].append(prob.distance(x, y))
+        for i in range(total_steps):
+            x, y = eg.step(prob, x, y)
+            m["traj"].append(prob.distance(x, y))
+            # m["state"] = (x, y)
+            eg_t2=process_time()
+            m["wc_times"].append(eg_t2 - eg_t1)
+
+    if not args.no_ogda:
+        og_t1=process_time()
+        m = methods["OGD"]
+        og_t2=process_time()
+        m["wc_times"].append(og_t1-og_t2)
+        
+        og, (x, y) = m["obj"], m["state"]
+        m["traj"].append(prob.distance(x, y))
+        for i in range(total_steps):
+            x, y = og.step(prob, x, y)
+            m["traj"].append(prob.distance(x, y))
+            #m["state"] = (x, y)
+            og_t2=process_time()
+            m["wc_times"].append(og_t2 - og_t1)
     
     if not args.no_fixed:
         fixed_t1=process_time()
-        m = methods[f"Fixed LA-GD (k={args.fixed_k}, α={args.fixed_alpha})" ]
-        m["wc_times"].append(fixed_t1)
+        m = methods[f"LA (k={args.fixed_k}, α={args.fixed_alpha})" ]
+        fixed_t2=process_time()
+        m["wc_times"].append(fixed_t1-fixed_t2)
         
         fl, (x, y) = m["obj"], m["state"]
         m["traj"].append(prob.distance(x, y))
@@ -182,8 +216,9 @@ def main():
 
     if not args.no_modal_weighted:
         modal_t1=process_time()
-        m = methods["Modal LA (dynamic) weighted"]
-        m["wc_times"].append(modal_t1)
+        m = methods["MoLA weighted"]
+        modal_t2=process_time()
+        m["wc_times"].append(modal_t1-modal_t2)
         eigs = jacobian_eigs(prob.A)
         cc = choose_modal_params_weighted_from_jacobian_eigs_weighted(
             eigs, ModalConfig(gamma=args.gamma, kmin=5, kmax=2000),  stability_all_modes=True, score_all_modes=True
@@ -209,11 +244,12 @@ def main():
 
     if not args.no_modal_dom:
         modal_t1=process_time()
-        m = methods["Modal LA (dynamic) dom"]
-        m["wc_times"].append(modal_t1)
+        m = methods["MoLA"]
+        modal_t2=process_time()
+        m["wc_times"].append(modal_t1-modal_t2)
         eigs = jacobian_eigs(prob.A)
         cc = choose_modal_params_dominant_from_jacobian_eigs_dom(
-            eigs, ModalConfig(gamma=args.gamma, kmin=5, kmax=2000), stability_all_modes=True, score_all_modes=True
+            eigs, ModalConfig(gamma=args.gamma, kmin=5, kmax=2000), stability_all_modes=False, score_all_modes=False
         )
         
         la, (x, y) = m["obj"], m["state"]
@@ -236,8 +272,9 @@ def main():
 
     if not args.no_modal_grid:
         modal_t1=process_time()
-        m = methods["Modal LA (dynamic) grid"]
-        m["wc_times"].append(modal_t1)
+        m = methods["MoLA grid"]
+        modal_t2=process_time()
+        m["wc_times"].append(modal_t1-modal_t2)
         eigs = jacobian_eigs(prob.A)
         cc = choose_modal_params_from_jacobian_eigs_grid(
             eigs, ModalConfig(gamma=args.gamma, kmin=5, kmax=2000)
@@ -261,38 +298,11 @@ def main():
             modal_t2=process_time()
             m["wc_times"].append(modal_t2-modal_t1)
 
-    if not args.no_eg:
-        eg_t1=process_time()
-        m = methods["Extragradient"]
-        m["wc_times"].append(eg_t1)
-        
-        eg, (x, y) = m["obj"], m["state"]
-        m["traj"].append(prob.distance(x, y))
-        for i in range(total_steps):
-            x, y = eg.step(prob, x, y)
-            m["traj"].append(prob.distance(x, y))
-            # m["state"] = (x, y)
-            eg_t2=process_time()
-            m["wc_times"].append(eg_t2 - eg_t1)
-
-    if not args.no_ogda:
-        og_t1=process_time()
-        m = methods["OGDA"]
-        m["wc_times"].append(og_t1)
-        
-        og, (x, y) = m["obj"], m["state"]
-        m["traj"].append(prob.distance(x, y))
-        for i in range(total_steps):
-            x, y = og.step(prob, x, y)
-            m["traj"].append(prob.distance(x, y))
-            #m["state"] = (x, y)
-            og_t2=process_time()
-            m["wc_times"].append(og_t2 - og_t1)
-
     if not args.no_sgd:
         gd_t1=process_time()
         m = methods["GD"]
-        m["wc_times"].append(gd_t1)
+        gd_t2=process_time()
+        m["wc_times"].append(gd_t1-gd_t2)
         sgd, (x, y) = m["obj"], m["state"]
         m["traj"].append(prob.distance(x, y))
         for i in range(total_steps):
@@ -305,7 +315,8 @@ def main():
     if not args.no_adam:
         ada_t1=process_time()
         m = methods["adam"]
-        m["wc_times"].append(ada_t1)
+        ada_t2=process_time()
+        m["wc_times"].append(ada_t1-ada_t2)
         
         (x, y) = m["state"]
         m["traj"].append(prob.distance(x.detach().cpu().numpy(),
@@ -330,8 +341,9 @@ def main():
 
         if not args.no_adamla:
             adamla_t1=process_time()
-            m = methods[f"Fixed LA-adam (k={args.fixed_k}, α={args.fixed_alpha})" ]
-            m["wc_times"].append(adamla_t1)
+            m = methods[f"LA-adam (k={args.fixed_k}, α={args.fixed_alpha})" ]
+            adamla_t2=process_time()
+            m["wc_times"].append(adamla_t1-adamla_t2)
             
             fl, (x, y) = m["obj"], m["state"]
             m["traj"].append(prob.distance(x.detach().cpu().numpy(),
